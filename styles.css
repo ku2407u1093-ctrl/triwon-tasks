@@ -292,3 +292,5 @@ td.good{color:var(--done);font-weight:600}
 .block .late{color:var(--late);font-weight:600}
 .block .soon{color:var(--warn);font-weight:600}
 .block .it{display:inline-flex;align-items:center;gap:4px}
+.row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+@media (max-width:560px){.row3{grid-template-columns:1fr 1fr}}

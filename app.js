@@ -121,6 +121,8 @@ const person = id => S.byId[id] || { full_name: "Unknown", color: "#98A2B3" };
 const canWork = t => isAdmin() || t.assignee === S.me.id;
 const canEditDetails = t => isAdmin() || (t.created_by === S.me.id && t.assignee === S.me.id);
 const canEditRoutine = r => isAdmin() || (r.assignee === S.me.id && r.created_by === S.me.id);
+const startOf = t => t.start_date || t.due_date;
+const activeOn = (t, d) => startOf(t) <= d && t.due_date >= d;
 const dueAt = t => new Date(`${t.due_date}T${t.due_time || "23:59"}`);
 function stateOf(t) {
   if (t.progress >= 100) return "done";
@@ -244,7 +246,7 @@ async function loadTasks() {
   S.tasks = m;
 }
 async function loadDay(date) {
-  const { data } = await sb.from("tasks").select(SEL).eq("due_date", date);
+  const { data } = await sb.from("tasks").select(SEL).lte("start_date", date).gte("due_date", date);
   (data || []).forEach(t => S.tasks.set(t.id, t));
 }
 async function loadRoutines() {
@@ -346,7 +348,8 @@ function dueHTML(t) {
   const diff = dueAt(t) - new Date();
   if (diff < 0) return `<span class="it late">${I.clock} Overdue ${fmtDur(diff)}</span>`;
   if (diff < 2 * 3600e3) return `<span class="it soon">${I.clock} Due in ${fmtDur(diff)}</span>`;
-  return `<span class="it">${I.clock} ${t.due_date === today() ? "" : dayLabel(t.due_date) + ", "}${fmtTime(t.due_time)}</span>`;
+  const range = startOf(t) !== t.due_date ? `${shortDate(startOf(t))} → ${shortDate(t.due_date)}, ` : (t.due_date === today() ? "" : dayLabel(t.due_date) + ", ");
+  return `<span class="it">${I.clock} ${range}${fmtTime(t.due_time)}</span>`;
 }
 function rowHTML(t, { who = true } = {}) {
   const p = person(t.assignee), st = stateOf(t), work = canWork(t);
@@ -372,8 +375,8 @@ function section(title, arr, opts = {}, cls = "") {
   return `<div class="section"><div class="sechead ${cls}">${title}<span class="count">${arr.length}</span></div>${arr.length ? listHTML(arr, opts) : `<div class="empty">${opts.empty || "Nothing here."}</div>`}</div>`;
 }
 function groupedUpcoming(arr, opts) {
-  const by = {}; arr.forEach(t => (by[t.due_date] ||= []).push(t));
-  return Object.keys(by).sort().map(d => section(dayLabel(d), by[d], opts)).join("");
+  const by = {}; arr.forEach(t => (by[startOf(t)] ||= []).push(t));
+  return Object.keys(by).sort().map(d => section("Starts " + dayLabel(d).replace(/^(Today|Tomorrow|Yesterday)$/, m => m.toLowerCase()), by[d], opts)).join("");
 }
 
 /* ================= stats / race ================= */
@@ -419,8 +422,8 @@ function viewToday() {
   const t0 = today(), uid = S.me.id;
   const mine = [...S.tasks.values()].filter(t => t.assignee === uid);
   const overdue = sortTasks(mine.filter(t => t.due_date < t0 && t.progress < 100));
-  const todays = sortTasks(mine.filter(t => t.due_date === t0));
-  const upcoming = sortTasks(mine.filter(t => t.due_date > t0 && t.due_date <= addDays(t0, 14)));
+  const todays = sortTasks(mine.filter(t => activeOn(t, t0)));
+  const upcoming = sortTasks(mine.filter(t => startOf(t) > t0 && startOf(t) <= addDays(t0, 14)));
   const doneToday = todays.filter(t => t.progress >= 100).length;
   const focus = todays.reduce((a, t) => a + liveSpent(t), 0);
   const race = raceTable(); const myIdx = race.findIndex(r => r.p.id === uid); const me = race[myIdx];
@@ -460,9 +463,9 @@ function titleDatalist(uid) {
 
 function viewTeam() {
   const d = S.teamDate;
-  const people = S.profiles.filter(p => p.role === "member" || [...S.tasks.values()].some(t => t.assignee === p.id && t.due_date === d));
+  const people = S.profiles.filter(p => p.role === "member" || [...S.tasks.values()].some(t => t.assignee === p.id && activeOn(t, d)));
   const cols = people.map(p => {
-    const ts = tasksWhere(t => t.assignee === p.id && t.due_date === d);
+    const ts = tasksWhere(t => t.assignee === p.id && activeOn(t, d));
     const done = ts.filter(t => t.progress >= 100).length, late = ts.filter(t => stateOf(t) === "late").length;
     const avg = ts.length ? Math.round(ts.reduce((a, t) => a + t.progress, 0) / ts.length) : 0;
     const sub = !ts.length ? "No tasks" : late ? `${late} not done · ${done}/${ts.length} done` : `${done}/${ts.length} done · ${avg}%`;
@@ -486,8 +489,8 @@ function viewMember() {
   const p = person(S.memberId), t0 = today();
   const mine = [...S.tasks.values()].filter(t => t.assignee === p.id);
   const overdue = sortTasks(mine.filter(t => t.due_date < t0 && t.progress < 100));
-  const todays = sortTasks(mine.filter(t => t.due_date === t0));
-  const upcoming = sortTasks(mine.filter(t => t.due_date > t0));
+  const todays = sortTasks(mine.filter(t => activeOn(t, t0)));
+  const upcoming = sortTasks(mine.filter(t => startOf(t) > t0));
   const recent = mine.filter(t => t.due_date < t0 && t.due_date >= addDays(t0, -7) && t.progress >= 100).sort((a, b) => b.due_date.localeCompare(a.due_date));
   const r = raceTable().find(x => x.p.id === p.id);
   return `
@@ -613,12 +616,12 @@ function bindView() {
   if (qa) qa.onsubmit = async e => {
     e.preventDefault(); const title = qa.q.value.trim(); if (!title) return;
     qa.q.value = "";
-    const { error } = await sb.from("tasks").insert({ title, assignee: S.me.id, due_date: today(), due_time: "18:00", priority: "medium", created_by: S.me.id });
+    const { error } = await sb.from("tasks").insert({ title, assignee: S.me.id, start_date: today(), due_date: today(), due_time: "18:00", priority: "medium", created_by: S.me.id });
     if (error) return toast(cleanErr(error), true);
     toast("Task added"); await loadTasks(); renderView(); $("#quickAdd input")?.focus();
   };
 }
-async function ensureDay(d) { if (![...S.tasks.values()].some(t => t.due_date === d)) await loadDay(d); }
+async function ensureDay(d) { if (![...S.tasks.values()].some(t => activeOn(t, d))) await loadDay(d); }
 
 /* ================= task actions ================= */
 async function toggleDone(id) {
@@ -677,7 +680,7 @@ function renderTaskSheet() {
     <div class="shead"><div class="grow"><h2>${esc(t.title)}</h2></div><button class="btn ghost icon" data-x aria-label="Close">${I.x}</button></div>
     <div class="smeta">
       <span class="chip">${av(p, "sm")}${esc(p.full_name)}</span>
-      <span>${dayLabel(t.due_date)}, ${fmtTime(t.due_time)}</span>
+      <span>${startOf(t) !== t.due_date ? `${dayLabel(startOf(t))} → ` : ""}${dayLabel(t.due_date)}, ${fmtTime(t.due_time)}</span>
       <span><span class="prio ${t.priority}"></span>${t.priority[0].toUpperCase() + t.priority.slice(1)}</span>
       ${t.routine_id ? `<span class="tag" style="margin:0">Daily routine</span>` : ""}
       <span class="pill ${st}">${STATE_LABEL[st]}</span>
@@ -825,6 +828,8 @@ function openTaskForm({ task = null, routine = null, assignee = null, date = nul
   let days = routine ? [...routine.days] : (REPEATS[rep] || [1, 2, 3, 4, 5, 6]);
   let prio = src.priority || "medium";
   const people = isAdmin() ? S.profiles : [S.me];
+  const startVal = task ? startOf(task) : routine ? routine.start_date : (date && date < today() ? date : today());
+  const endVal = task ? task.due_date : (date && date > startVal ? date : startVal);
   const title = task ? "Edit task" : routine ? "Edit routine" : rep !== "none" ? "New routine" : isAdmin() ? "Assign a task" : "Add a task";
   openSheet(`
     <div class="shead"><div class="grow"><h2>${title}</h2></div><button class="btn ghost icon" data-x aria-label="Close">${I.x}</button></div>
@@ -839,9 +844,10 @@ function openTaskForm({ task = null, routine = null, assignee = null, date = nul
         <option value="monfri" ${rep === "monfri" ? "selected" : ""}>Weekdays (Mon – Fri)</option>
         <option value="custom" ${rep === "custom" ? "selected" : ""}>Custom days…</option></select></label>
         <div class="field ${rep === "custom" ? "" : "hide"}" id="dayField"><span>On these days</span><div class="daychips">${[1, 2, 3, 4, 5, 6, 0].map(d => `<button type="button" data-d="${d}" class="${days.includes(d) ? "on" : ""}">${DOW[d]}</button>`).join("")}</div></div>`}
-      <div class="row2">
-        <label class="field" id="dateField"><span id="dateLbl">${rep !== "none" && !task ? "Starts on" : "Date"}</span><input class="input" type="date" name="date" required value="${task ? task.due_date : routine ? routine.start_date : (date || today())}"></label>
-        <label class="field"><span>Due by</span><input class="input" type="time" name="time" required value="${src.due_time || "18:00"}"></label>
+      <div class="row3">
+        <label class="field"><span id="dateLbl">${rep !== "none" && !task ? "Starts on" : "Start date"}</span><input class="input" type="date" name="date" required value="${startVal}"></label>
+        <label class="field ${rep !== "none" && !task ? "hide" : ""}" id="endField"><span>End date</span><input class="input" type="date" name="end" value="${endVal}" min="${startVal}"></label>
+        <label class="field"><span>Due time</span><input class="input" type="time" name="time" required value="${src.due_time || "18:00"}"></label>
       </div>
       <div class="field"><span>Priority</span><div class="seg" id="prioSeg">${["low", "medium", "high"].map(v => `<button type="button" data-p="${v}" class="${prio === v ? "on" : ""}">${v[0].toUpperCase() + v.slice(1)}</button>`).join("")}</div></div>
       <label class="field"><span>Details <small style="font-weight:400;color:var(--muted)">optional</small></span><textarea class="textarea" name="notes" maxlength="1500" placeholder="What does done look like? Targets, links, who to contact…">${esc(src.notes || "")}</textarea></label>
@@ -859,19 +865,23 @@ function openTaskForm({ task = null, routine = null, assignee = null, date = nul
   if (f.repeat) f.repeat.onchange = () => {
     rep = f.repeat.value; if (REPEATS[rep]) { days = [...REPEATS[rep]]; $$("[data-d]").forEach(b => b.classList.toggle("on", days.includes(+b.dataset.d))); }
     $("#dayField").classList.toggle("hide", rep !== "custom");
-    $("#dateLbl").textContent = rep !== "none" ? "Starts on" : "Date";
+    $("#dateLbl").textContent = rep !== "none" ? "Starts on" : "Start date";
+    $("#endField").classList.toggle("hide", rep !== "none");
     $("#tfSave").textContent = editing ? "Save changes" : rep !== "none" ? "Create routine" : isAdmin() ? "Assign task" : "Add task";
   };
   $("[data-delr]")?.addEventListener("click", () => deleteRoutine(routine));
+  f.date.addEventListener("change", () => { f.end.min = f.date.value; if (f.end.value < f.date.value) f.end.value = f.date.value; });
   f.onsubmit = async e => {
     e.preventDefault();
     const data = { title: f.ttl.value.trim(), notes: f.notes.value.trim(), assignee: f.assignee ? f.assignee.value : S.me.id, due_time: f.time.value, priority: prio };
     if (!data.title) return;
+    const startD = f.date.value, endD = f.end.value || startD;
+    if ((task || rep === "none") && endD < startD) return toast("End date can't be before the start date.", true);
     $("#tfSave").disabled = true;
     let error;
     if (task) {
-      ({ error } = await sb.from("tasks").update({ ...data, due_date: f.date.value }).eq("id", task.id));
-      if (!error) { Object.assign(task, data, { due_date: f.date.value }); toast("Task updated"); safeRender(); openTask(task.id); return; }
+      ({ error } = await sb.from("tasks").update({ ...data, start_date: startD, due_date: endD }).eq("id", task.id));
+      if (!error) { Object.assign(task, data, { start_date: startD, due_date: endD }); toast("Task updated"); safeRender(); openTask(task.id); return; }
     } else if (rep !== "none") {
       if (!days.length) { $("#tfSave").disabled = false; return toast("Pick at least one day.", true); }
       const r = { ...data, days: [...days].sort(), start_date: f.date.value };
@@ -887,7 +897,7 @@ function openTaskForm({ task = null, routine = null, assignee = null, date = nul
         closeSheet(); toast(routine ? "Routine updated" : `Routine created · ${daysText(days)}`); safeRender(); return;
       }
     } else {
-      ({ error } = await sb.from("tasks").insert({ ...data, due_date: f.date.value, created_by: S.me.id }));
+      ({ error } = await sb.from("tasks").insert({ ...data, start_date: startD, due_date: endD, created_by: S.me.id }));
       if (!error) { await loadTasks(); closeSheet(); toast(isAdmin() && data.assignee !== S.me.id ? `Assigned to ${person(data.assignee).full_name}` : "Task added"); safeRender(); return; }
     }
     $("#tfSave").disabled = false;
